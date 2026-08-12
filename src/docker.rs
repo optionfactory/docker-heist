@@ -66,10 +66,13 @@ impl<'a> Drop for ContainerGuard<'a> {
 }
 
 fn resolve_socket_path() -> String {
-    if let Ok(docker_host) = std::env::var("DOCKER_HOST") {
-        if let Some(path) = docker_host.strip_prefix("unix://") {
-            return path.to_string();
-        }
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    resolve_socket_path_from(docker_host.as_deref())
+}
+
+fn resolve_socket_path_from(docker_host: Option<&str>) -> String {
+    if let Some(path) = docker_host.and_then(|h| h.strip_prefix("unix://")) {
+        return path.to_string();
     }
     "/var/run/docker.sock".to_string()
 }
@@ -126,19 +129,7 @@ impl DockerClient {
             .read_to_string(&mut response)
             .map_err(|e| e.to_string())?;
 
-        let first_line = response.lines().next().ok_or("Empty response")?;
-        let status_code = first_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<u16>().ok())
-            .ok_or("Malformed HTTP response")?;
-
-        let body = match response.find("\r\n\r\n") {
-            Some(index) => response[index + 4..].to_string(),
-            None => String::new(),
-        };
-
-        Ok((status_code, body))
+        parse_http_response(&response)
     }
 
     pub fn ping(&self) -> Result<(), String> {
@@ -228,5 +219,150 @@ impl DockerClient {
             return Err("Container holder is not running. Ensure the image is valid and try again.".to_string());
         }
         Ok(inspect_data.state.pid)
+    }
+}
+
+fn parse_http_response(response: &str) -> Result<(u16, String), String> {
+    let first_line = response.lines().next().ok_or("Empty response")?;
+    let status_code = first_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or("Malformed HTTP response")?;
+    let body = match response.find("\r\n\r\n") {
+        Some(index) => response[index + 4..].to_string(),
+        None => String::new(),
+    };
+    Ok((status_code, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_path_defaults_when_docker_host_unset() {
+        assert_eq!(resolve_socket_path_from(None), "/var/run/docker.sock");
+    }
+
+    #[test]
+    fn socket_path_honors_unix_scheme() {
+        assert_eq!(
+            resolve_socket_path_from(Some("unix:///custom/docker.sock")),
+            "/custom/docker.sock"
+        );
+    }
+
+    #[test]
+    fn socket_path_ignores_non_unix_schemes() {
+        // Locks in current behavior: a tcp:// DOCKER_HOST silently falls back to the
+        // default path rather than erroring. Tighten if desired.
+        assert_eq!(
+            resolve_socket_path_from(Some("tcp://1.2.3.4:2375")),
+            "/var/run/docker.sock"
+        );
+    }
+
+    #[test]
+    fn socket_path_unix_scheme_with_relative_input_yields_relative_path() {
+        // Known footgun: "unix://relative" strips the scheme and yields a relative
+        // path. Locking in current behavior; consider validating the result is absolute.
+        assert_eq!(
+            resolve_socket_path_from(Some("unix://relative/path")),
+            "relative/path"
+        );
+    }
+
+    #[test]
+    fn socket_path_unix_scheme_with_empty_path_yields_empty() {
+        assert_eq!(resolve_socket_path_from(Some("unix://")), "");
+    }
+
+    #[test]
+    fn http_parses_status_and_json_body() {
+        let resp = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"Id\":\"abc\"}";
+        let (status, body) = parse_http_response(resp).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "{\"Id\":\"abc\"}");
+    }
+
+    #[test]
+    fn http_parses_empty_body() {
+        let (status, body) = parse_http_response("HTTP/1.0 204 No Content\r\n\r\n").unwrap();
+        assert_eq!(status, 204);
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn http_parses_error_status_with_body() {
+        let resp = "HTTP/1.0 404 Not Found\r\nContent-Type: text/plain\r\n\r\nno such container";
+        let (status, body) = parse_http_response(resp).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(body, "no such container");
+    }
+
+    #[test]
+    fn http_parses_status_line_without_reason_phrase() {
+        let (status, _) = parse_http_response("HTTP/1.0 201\r\n\r\n").unwrap();
+        assert_eq!(status, 201);
+    }
+
+    #[test]
+    fn http_handles_body_containing_blank_line() {
+        // Body that itself contains CRLFCRLF must not confuse the splitter:
+        // only the first occurrence separates headers from body.
+        let resp = "HTTP/1.0 200 OK\r\n\r\nline1\r\n\r\nline2";
+        let (status, body) = parse_http_response(resp).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "line1\r\n\r\nline2");
+    }
+
+    #[test]
+    fn http_rejects_empty_response() {
+        assert!(parse_http_response("").is_err());
+    }
+
+    #[test]
+    fn http_rejects_malformed_status_line() {
+        assert!(parse_http_response("garbage\r\n\r\n").is_err());
+        assert!(parse_http_response("HTTP/1.0\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn http_yields_empty_body_when_no_header_separator_present() {
+        // Documents current behavior: the splitter requires CRLFCRLF. A response
+        // with LF-only line endings parses status but yields an empty body.
+        let (status, body) = parse_http_response("HTTP/1.0 201 Created\n\nbody-here").unwrap();
+        assert_eq!(status, 201);
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn create_payload_serializes_to_docker_field_names() {
+        let mut endpoints = HashMap::new();
+        endpoints.insert(
+            "devnet".to_string(),
+            EndpointConfig {
+                ipam_config: IpamConfig {
+                    ipv4_address: "172.18.0.22".to_string(),
+                },
+            },
+        );
+        let payload = CreateContainerPayload {
+            image: "img".to_string(),
+            host_config: HostConfig {
+                network_mode: "devnet".to_string(),
+            },
+            networking_config: NetworkingConfig {
+                endpoints_config: endpoints,
+            },
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["Image"], "img");
+        assert_eq!(json["HostConfig"]["NetworkMode"], "devnet");
+        assert_eq!(
+            json["NetworkingConfig"]["EndpointsConfig"]["devnet"]["IPAMConfig"]["IPv4Address"],
+            "172.18.0.22"
+        );
     }
 }
