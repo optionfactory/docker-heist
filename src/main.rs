@@ -120,13 +120,25 @@ fn execute_in_namespace(config: cli::Config) -> Result<i32, String> {
                 let err = Command::new(program).args(args).exec();
                 Err(format!("Failed to exec target command: {err}"))
             };
-            if let Err(e) = run_child() {
-                eprintln!("Namespace Error: {e}");
-                std::process::exit(1);
+            match run_child() {
+                Ok(()) => unsafe { libc::_exit(0) },
+                Err(e) => fail_fast(&e),
             }
-            std::process::exit(0);
         }
         Err(e) => Err(format!("Process fork failed: {e}")),
+    }
+}
+
+fn fail_fast(msg: &str) -> ! {
+    unsafe {
+        for part in [b"docker-intrude: ".as_slice(), msg.as_bytes(), b"\n".as_slice()] {
+            let _ = libc::write(
+                libc::STDERR_FILENO,
+                part.as_ptr() as *const libc::c_void,
+                part.len(),
+            );
+        }
+        libc::_exit(1);
     }
 }
 
