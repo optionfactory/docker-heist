@@ -83,6 +83,7 @@ fn execute_in_namespace(config: cli::Config) -> Result<i32, String> {
     match unsafe { unistd::fork() } {
         Ok(unistd::ForkResult::Parent { child }) => {
             drop(ns_file);
+            drop_parent_capabilities()?;
 
             unsafe {
                 let _ = signal(Signal::SIGINT, SigHandler::SigIgn);
@@ -171,6 +172,20 @@ fn drop_capabilities(strict: bool, lax: bool) -> Result<(), String> {
     caps::clear(None, caps::CapSet::Inheritable)
         .map_err(|e| format!("Failed to drop inheritable capabilities: {e}"))?;
     caps::clear(None, caps::CapSet::Ambient).map_err(|e| format!("Failed to drop ambient capabilities: {e}"))?;
+    Ok(())
+}
+
+fn drop_parent_capabilities() -> Result<(), String> {
+    caps::clear(None, caps::CapSet::Bounding)
+        .map_err(|e| format!("Failed to drop parent bounding capabilities: {e}"))?;
+    caps::clear(None, caps::CapSet::Effective)
+        .map_err(|e| format!("Failed to drop parent effective capabilities: {e}"))?;
+    caps::clear(None, caps::CapSet::Permitted)
+        .map_err(|e| format!("Failed to drop parent permitted capabilities: {e}"))?;
+    caps::clear(None, caps::CapSet::Inheritable)
+        .map_err(|e| format!("Failed to drop parent inheritable capabilities: {e}"))?;
+    caps::clear(None, caps::CapSet::Ambient)
+        .map_err(|e| format!("Failed to drop parent ambient capabilities: {e}"))?;
     Ok(())
 }
 

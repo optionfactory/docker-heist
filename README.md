@@ -8,7 +8,7 @@ It spins up a temporary container with a static IP, uses `nsenter` to attach you
 
 By default, `docker-intrude` is designed to run tools that require Linux file capabilities (like `/bin/ping` or `gdb`). 
 To balance usability and security, it applies the following isolation measures before executing your command:
-- **Capability Shedding:** Drops all Effective, Permitted, Inheritable, and Ambient capabilities.
+- **Capability Shedding:** The wrapper holds its file capabilities (`cap_sys_admin`, `cap_sys_ptrace`, `cap_setpcap`) only long enough to enter the namespace and mount `resolv.conf`. After `fork()`, the parent drops **all** capability sets (including Bounding) before entering its wait loop; the child drops Effective/Permitted/Inheritable/Ambient (and Bounding, in `--strict` mode) before exec'ing the target.
 - **Setuid Protection:** Activates and **locks** `SECBIT_NOROOT` (and `SECBIT_NO_CAP_AMBIENT_RAISE`) so that legacy setuid-root binaries can no longer automatically acquire root privileges during execution. Locking makes the boundary irreversible for the lifetime of the spawned process; without the lock, `SECBIT_NOROOT` would be advisory only, since any process can clear it via `prctl` without requiring any capability.
 - **Bounding Set Preservation:** Leaves the Capability Bounding Set intact by default so that legitimate file capabilities continue to function.
 
