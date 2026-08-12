@@ -5,6 +5,7 @@ use std::os::unix::net::UnixStream;
 
 //pinned to optionfactory/sloth:230
 const SLOTH_IMAGE: &str = "optionfactory/sloth:230@sha256:b97e97549fa55b96aa81b0f897de9e779009bc6f95c1461865465b14cdc69acf";
+const SLOTH_IMAGE_ENCODED: &str = "optionfactory%2Fsloth%3A230%40sha256%3Ab97e97549fa55b96aa81b0f897de9e779009bc6f95c1461865465b14cdc69acf";
 
 #[derive(serde::Serialize)]
 struct HostConfig {
@@ -153,7 +154,7 @@ impl DockerClient {
         }
 
         let (pull_status, pull_body) =
-            self.query_socket("POST", &format!("/images/create?fromImage={}", SLOTH_IMAGE), None)?;
+            self.query_socket("POST", &format!("/images/create?fromImage={}", SLOTH_IMAGE_ENCODED), None)?;
 
         if pull_status != 200 {
             return Err(format!("Failed to pull Docker image '{}': {}", SLOTH_IMAGE, pull_body));
@@ -338,8 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn create_payload_serializes_to_docker_field_names() {
-        let mut endpoints = HashMap::new();
+    fn create_payload_serializes_to_docker_field_names() {        let mut endpoints = HashMap::new();
         endpoints.insert(
             "devnet".to_string(),
             EndpointConfig {
@@ -363,6 +363,24 @@ mod tests {
         assert_eq!(
             json["NetworkingConfig"]["EndpointsConfig"]["devnet"]["IPAMConfig"]["IPv4Address"],
             "172.18.0.22"
+        );
+    }
+
+    #[test]
+    fn sloth_image_encoded_stays_in_sync_with_raw() {
+        let expected: String = SLOTH_IMAGE
+            .chars()
+            .map(|c| match c {
+                '/' => "%2F".to_string(),
+                ':' => "%3A".to_string(),
+                '@' => "%40".to_string(),
+                c => c.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            SLOTH_IMAGE_ENCODED, expected,
+            "SLOTH_IMAGE_ENCODED must be the percent-encoded form of SLOTH_IMAGE; \
+             regenerate it when SLOTH_IMAGE is updated."
         );
     }
 }
