@@ -9,7 +9,7 @@ It spins up a temporary container with a static IP, uses `nsenter` to attach you
 By default, `docker-intrude` is designed to run tools that require Linux file capabilities (like `/bin/ping` or `gdb`). 
 To balance usability and security, it applies the following isolation measures before executing your command:
 - **Capability Shedding:** Drops all Effective, Permitted, Inheritable, and Ambient capabilities.
-- **Setuid Protection:** Activates `SECBIT_NOROOT` to prevent legacy setuid-root binaries from automatically acquiring root privileges during execution.
+- **Setuid Protection:** Activates and **locks** `SECBIT_NOROOT` (and `SECBIT_NO_CAP_AMBIENT_RAISE`) so that legacy setuid-root binaries can no longer automatically acquire root privileges during execution. Locking makes the boundary irreversible for the lifetime of the spawned process; without the lock, `SECBIT_NOROOT` would be advisory only, since any process can clear it via `prctl` without requiring any capability.
 - **Bounding Set Preservation:** Leaves the Capability Bounding Set intact by default so that legitimate file capabilities continue to function.
 
 ### Accepted Design Tradeoffs & Operational Limits
@@ -26,6 +26,19 @@ pass the `--strict` flag to clear the Bounding Set as well:
 
 ```bash
 docker-intrude --name my-project --net dev-net --ip 172.18.0.22 --strict -- ping 172.18.0.1
+```
+
+### Lax Mode (`--lax`)
+If your command needs a setuid-root binary to actually function as root (for example `sudo`, or a
+legacy installer), the default locked `SECBIT_NOROOT` boundary will block it. Pass `--lax` to skip
+securebits manipulation entirely, so setuid-root binaries can acquire privileges through the normal
+kernel path. File capabilities continue to work (the Bounding Set is preserved).
+
+`--lax` reduces isolation and is mutually exclusive with `--strict`. Use it only when the command
+genuinely requires it.
+
+```bash
+docker-intrude --name my-project --net dev-net --ip 172.18.0.22 --lax -- sudo whoami
 ```
 
 ## How It Works & DNS Resolution
@@ -83,4 +96,6 @@ docker-intrude --name my-project --net dev-net --ip 172.18.0.22 -- ./mvn spring-
 - `--net` : The Docker network to join.
 - `--ip` : The IP address to assign to the container.
 - `--verbose`, `-v` : Enable detailed setup and status logging.
+- `--strict` : Clear the Capability Bounding Set (maximum isolation; breaks file-capability tools like `ping`/`gdb`).
+- `--lax` : Disable setuid-root protection entirely (no securebits). For commands needing `sudo`/legacy setuid tools. Mutually exclusive with `--strict`.
 - `--` : Separates wrapper arguments from the command being executed.

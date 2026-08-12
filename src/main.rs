@@ -115,7 +115,7 @@ fn execute_in_namespace(config: cli::Config) -> Result<i32, String> {
                     .map_err(|e| format!("Failed to setns. Ensure binary has CAP_SYS_ADMIN and CAP_SYS_PTRACE: {e}"))?;
 
                 mount_resolve_conf()?;
-                drop_capabilities(config.strict)?;
+                drop_capabilities(config.strict, config.lax)?;
                 let (program, args) = config.cmd.split_first().ok_or("No command specified to execute")?;
                 let err = Command::new(program).args(args).exec();
                 Err(format!("Failed to exec target command: {err}"))
@@ -130,14 +130,26 @@ fn execute_in_namespace(config: cli::Config) -> Result<i32, String> {
     }
 }
 
-fn drop_capabilities(strict: bool) -> Result<(), String> {
-    const SECBIT_NOROOT: libc::c_ulong = 0x01;
-    let res = unsafe { libc::prctl(libc::PR_SET_SECUREBITS, SECBIT_NOROOT, 0, 0, 0) };
-    if res != 0 {
-        return Err(format!(
-            "Failed to set SECBIT_NOROOT via prctl: {}",
-            std::io::Error::last_os_error()
-        ));
+const SECBIT_NOROOT: libc::c_ulong = 0x01;
+const SECBIT_NOROOT_LOCKED: libc::c_ulong = 0x02;
+const SECBIT_NO_CAP_AMBIENT_RAISE: libc::c_ulong = 0x40;
+const SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED: libc::c_ulong = 0x80;
+
+// NOROOT must be LOCKED: any process can clear securebits via prctl without
+// requiring any capability, so an unlocked NOROOT is advisory only. Ambient
+// raise is locked as well since we clear the Ambient set below.
+const SECUREBITS_MASK: libc::c_ulong =
+    SECBIT_NOROOT | SECBIT_NOROOT_LOCKED | SECBIT_NO_CAP_AMBIENT_RAISE | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+
+fn drop_capabilities(strict: bool, lax: bool) -> Result<(), String> {
+    if !lax {
+        let res = unsafe { libc::prctl(libc::PR_SET_SECUREBITS, SECUREBITS_MASK, 0, 0, 0) };
+        if res != 0 {
+            return Err(format!(
+                "Failed to set securebits (NOROOT+ambient-raise, locked) via prctl: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
     if strict {
         caps::clear(None, caps::CapSet::Bounding).map_err(|e| format!("Failed to drop bounding capabilities: {e}"))?;
@@ -218,4 +230,54 @@ fn terminate_child_gracefully(child: unistd::Pid) -> Result<i32, String> {
     let _ = kill(child, Signal::SIGKILL);
     let _ = wait::waitpid(child, None);
     Err("Child process unresponsive to SIGTERM; forcefully terminated with SIGKILL".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Note: we assert on the composed mask rather than calling prctl, because
+    // SECBIT_*_LOCKED is irreversible for the lifetime of the process — actually
+    // invoking drop_capabilities() would poison the test runner. The mask IS the
+    // security property, so guarding its composition is the meaningful check.
+
+    #[test]
+    fn securebits_locks_noroot() {
+        assert_ne!(
+            SECUREBITS_MASK & SECBIT_NOROOT_LOCKED, 0,
+            "SECBIT_NOROOT must be locked; an unlocked NOROOT is advisory only \
+             (any process can clear it via prctl without a capability)."
+        );
+        assert_ne!(SECUREBITS_MASK & SECBIT_NOROOT, 0);
+    }
+
+    #[test]
+    fn securebits_locks_ambient_raise() {
+        assert_ne!(SECUREBITS_MASK & SECBIT_NO_CAP_AMBIENT_RAISE, 0);
+        assert_ne!(SECUREBITS_MASK & SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED, 0);
+    }
+
+    #[test]
+    fn securebits_does_not_touch_unrelated_flags() {
+        // KEEPCAPS and NO_SETUID_FIXUP are intentionally not set: the target is
+        // not expected to perform UID transitions.
+        const SECBIT_NO_SETUID_FIXUP: libc::c_ulong = 0x04;
+        const SECBIT_NO_SETUID_FIXUP_LOCKED: libc::c_ulong = 0x08;
+        const SECBIT_KEEP_CAPS: libc::c_ulong = 0x10;
+        const SECBIT_KEEP_CAPS_LOCKED: libc::c_ulong = 0x20;
+        let unused = SECBIT_NO_SETUID_FIXUP
+            | SECBIT_NO_SETUID_FIXUP_LOCKED
+            | SECBIT_KEEP_CAPS
+            | SECBIT_KEEP_CAPS_LOCKED;
+        assert_eq!(SECUREBITS_MASK & unused, 0);
+    }
+
+    #[test]
+    fn securebits_values_match_kernel_constants() {
+        // Guards against bit-value drift if someone rewrites these consts.
+        assert_eq!(SECBIT_NOROOT, 0x01);
+        assert_eq!(SECBIT_NOROOT_LOCKED, 0x02);
+        assert_eq!(SECBIT_NO_CAP_AMBIENT_RAISE, 0x40);
+        assert_eq!(SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED, 0x80);
+    }
 }

@@ -9,6 +9,7 @@ pub struct Config {
     pub ip: String,
     pub verbose: bool,
     pub strict: bool,
+    pub lax: bool,
     pub cmd: Vec<String>,
 }
 
@@ -38,6 +39,7 @@ fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String>
     let mut ip = None;
     let mut verbose = false;
     let mut strict = false;
+    let mut lax = false;
     let mut cmd = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -47,6 +49,7 @@ fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String>
             "--ip" => ip = Some(args.next().ok_or("Missing value for --ip")?),
             "--verbose" | "-v" => verbose = true,
             "--strict" => strict = true,
+            "--lax" => lax = true,
             "--" => {
                 cmd.extend(args);
                 break;
@@ -77,6 +80,9 @@ fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String>
     if !is_valid_docker_identifier(&name_val) || !is_valid_docker_identifier(&net_val) {
         return Err("Invalid network or container identifier syntax".to_string());
     }
+    if strict && lax {
+        return Err("--strict and --lax are mutually exclusive.".to_string());
+    }
 
     Ok(Config {
         name: name_val,
@@ -84,7 +90,8 @@ fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String>
         ip: ip_val,
         verbose,
         cmd,
-        strict
+        strict,
+        lax,
     })
 }
 
@@ -99,12 +106,14 @@ fn print_help() {
     eprintln!("docker-intrude - Run commands directly within a specific Docker network namespace");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  docker-intrude --name <NAME> --net <NET> --ip <IP> [-v] [--strict] -- <CMD...>");
+    eprintln!("  docker-intrude --name <NAME> --net <NET> --ip <IP> [-v] [--strict|--lax] -- <CMD...>");
     eprintln!("  docker-intrude --help");
     eprintln!("  docker-intrude --version");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --strict       Clear the capability bounding set (breaks ping/gdb file capabilities, provides maximum isolation)");
+    eprintln!("  --lax          Disable setuid-root protection entirely (no securebits). Required when the command");
+    eprintln!("                 needs setuid-root binaries to function (e.g. sudo). Reduces isolation; not combinable with --strict.");
 }
 
 #[cfg(test)]
@@ -177,6 +186,30 @@ mod tests {
         let cfg = ok(&["--name", "n", "--net", "m", "--ip", "1.2.3.4", "-v", "--strict", "--", "x"]);
         assert!(cfg.verbose);
         assert!(cfg.strict);
+    }
+
+    #[test]
+    fn lax_defaults_to_false() {
+        let cfg = ok(&["--name", "n", "--net", "m", "--ip", "1.2.3.4", "--", "x"]);
+        assert!(!cfg.lax);
+    }
+
+    #[test]
+    fn enables_lax() {
+        let cfg = ok(&["--name", "n", "--net", "m", "--ip", "1.2.3.4", "--lax", "--", "x"]);
+        assert!(cfg.lax);
+        assert!(!cfg.strict);
+    }
+
+    #[test]
+    fn rejects_strict_combined_with_lax() {
+        let err = parse_from(args(&[
+            "--name", "n", "--net", "m", "--ip", "1.2.3.4", "--strict", "--lax", "--", "x",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        assert!(err.contains("--strict"), "{err}");
+        assert!(err.contains("--lax"), "{err}");
     }
 
     #[test]
