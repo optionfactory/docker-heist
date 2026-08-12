@@ -42,4 +42,4 @@ publish-github: build-release
 		--title "$(VERSION)" \
 		--target "master" \
 		--notes ""
-	-@rm target/$(REPO_NAME)-linux-amd64-musl SHA256SUMS
+	-@rm target/$(REPO_NAME)-linux-amd64-musl target/SHA256SUMS
