@@ -63,7 +63,7 @@ To address this without modifying your host filesystem, `docker-intrude` overrid
 Install the latest pre-compiled binary via curl:
 ```bash
 curl -sSL \
-  [https://github.com/optionfactory/docker-intrude/releases/latest/download/docker-intrude-linux-amd64-musl](https://github.com/optionfactory/docker-intrude/releases/latest/download/docker-intrude-linux-amd64-musl) \
+  https://github.com/optionfactory/docker-intrude/releases/latest/download/docker-intrude-linux-amd64-musl \
   | sudo tee /usr/local/bin/docker-intrude > /dev/null \
   && sudo chown root:docker /usr/local/bin/docker-intrude \
   && sudo chmod 750 /usr/local/bin/docker-intrude \
