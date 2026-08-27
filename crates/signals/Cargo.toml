@@ -1,0 +1,9 @@
+[package]
+name = "signals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parent-side signal handling for the docker-heist tools: ignore terminal signals, catch SIGTERM into a flag, reset dispositions before exec"
+
+[dependencies]
+libc.workspace = true

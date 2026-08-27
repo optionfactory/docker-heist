@@ -2,30 +2,20 @@ mod cli;
 mod docker;
 
 use docker::DockerClient;
-use nix::mount;
-use nix::sched;
-use nix::sched::setns;
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction, signal};
-use nix::sys::wait;
-use nix::unistd;
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, exit};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static TERMINATED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_term(_: libc::c_int) {
-    TERMINATED.store(true, Ordering::Relaxed);
-}
 
 fn main() {
     let config = match cli::parse_args() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Error: {e}");
+            eprintln!("docker-intrude: {e}");
             exit(1);
         }
     };
@@ -37,7 +27,7 @@ fn main() {
             }
         }
         Err(e) => {
-            eprintln!("Error: {e}");
+            eprintln!("docker-intrude: {e}");
             exit(1);
         }
     }
@@ -80,64 +70,80 @@ fn execute_in_namespace(config: cli::Config) -> Result<i32, String> {
         println!(":: Entering namespace ::");
     }
 
-    match unsafe { unistd::fork() } {
-        Ok(unistd::ForkResult::Parent { child }) => {
-            drop(ns_file);
-            drop_parent_capabilities()?;
-
-            unsafe {
-                let _ = signal(Signal::SIGINT, SigHandler::SigIgn);
-                let _ = signal(Signal::SIGQUIT, SigHandler::SigIgn);
-
-                let action = SigAction::new(SigHandler::Handler(handle_term), SaFlags::empty(), SigSet::empty());
-                let _ = sigaction(Signal::SIGTERM, &action);
-            }
-
-            loop {
-                match wait::waitpid(child, None) {
-                    Ok(wait::WaitStatus::Exited(_, code)) => return Ok(code),
-                    Ok(wait::WaitStatus::Signaled(_, signal, _)) => {
-                        return Err(format!("Child process terminated by signal: {:?}", signal));
-                    }
-                    Err(nix::errno::Errno::EINTR) => {
-                        if TERMINATED.load(Ordering::Relaxed) {
-                            return terminate_child_gracefully(child);
-                        }
-                        continue;
-                    }
-                    Err(e) => return Err(format!("Failed to harvest child process exit status: {e}")),
-                    _ => return Err("Unexpected waitpid status".to_string()),
-                }
-            }
-        }
-        Ok(nix::unistd::ForkResult::Child) => {
-            let run_child = move || -> Result<(), String> {
-                setns(ns_file, nix::sched::CloneFlags::CLONE_NEWNET)
-                    .map_err(|e| format!("Failed to setns. Ensure binary has CAP_SYS_ADMIN and CAP_SYS_PTRACE: {e}"))?;
-
-                mount_resolve_conf()?;
-                drop_capabilities(config.strict, config.lax)?;
-                let (program, args) = config.cmd.split_first().ok_or("No command specified to execute")?;
-                let err = Command::new(program).args(args).exec();
-                Err(format!("Failed to exec target command: {err}"))
-            };
-            match run_child() {
-                Ok(()) => unsafe { libc::_exit(0) },
-                Err(e) => fail_fast(&e),
-            }
-        }
-        Err(e) => Err(format!("Process fork failed: {e}")),
+    // SAFETY: fork; the child branch does its work and never returns into code
+    // that could deadlock on a lock held at fork time (single-threaded here).
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(format!("Process fork failed: {}", std::io::Error::last_os_error()));
     }
+
+    if child == 0 {
+        // ---- child ----
+        let run_child = move || -> Result<(), String> {
+            enter_net_namespace(&ns_file)?;
+            mount_resolve_conf()?;
+            drop_capabilities(config.strict, config.lax)?;
+            let (program, args) = config.cmd.split_first().ok_or("No command specified to execute")?;
+            let err = Command::new(program).args(args).exec();
+            Err(format!("Failed to exec target command: {err}"))
+        };
+        match run_child() {
+            Ok(()) => unsafe { libc::_exit(0) },
+            Err(e) => fail_fast(&e),
+        }
+    }
+
+    // ---- parent ----
+    drop(ns_file);
+    drop_parent_capabilities()?;
+    // Ignore the terminal signals the child handles itself, and catch SIGTERM so
+    // the waitpid loop below (interrupted by EINTR) can forward it to the child.
+    signals::install(&[libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
+
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid on our own child with a valid status pointer.
+        let r = unsafe { libc::waitpid(child, &mut status, 0) };
+        if r == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                if signals::terminate_requested() {
+                    return terminate_child_gracefully(child);
+                }
+                continue;
+            }
+            return Err(format!("Failed to harvest child process exit status: {err}"));
+        }
+        if libc::WIFEXITED(status) {
+            return Ok(libc::WEXITSTATUS(status));
+        }
+        if libc::WIFSIGNALED(status) {
+            return Err(format!(
+                "Child process terminated by signal: {}",
+                libc::WTERMSIG(status)
+            ));
+        }
+        // stopped/continued: keep waiting.
+    }
+}
+
+/// `setns(2)` the open network-namespace file into CLONE_NEWNET.
+fn enter_net_namespace(ns_file: &File) -> Result<(), String> {
+    // SAFETY: valid fd; CLONE_NEWNET selects the network namespace type.
+    let rc = unsafe { libc::setns(ns_file.as_raw_fd(), libc::CLONE_NEWNET) };
+    if rc != 0 {
+        return Err(format!(
+            "Failed to setns. Ensure binary has CAP_SYS_ADMIN and CAP_SYS_PTRACE: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 fn fail_fast(msg: &str) -> ! {
     unsafe {
         for part in [b"docker-intrude: ".as_slice(), msg.as_bytes(), b"\n".as_slice()] {
-            let _ = libc::write(
-                libc::STDERR_FILENO,
-                part.as_ptr() as *const libc::c_void,
-                part.len(),
-            );
+            let _ = libc::write(libc::STDERR_FILENO, part.as_ptr() as *const libc::c_void, part.len());
         }
         libc::_exit(1);
     }
@@ -156,6 +162,7 @@ const SECUREBITS_MASK: libc::c_ulong =
 
 fn drop_capabilities(strict: bool, lax: bool) -> Result<(), String> {
     if !lax {
+        // SAFETY: plain prctl setting the securebits mask.
         let res = unsafe { libc::prctl(libc::PR_SET_SECUREBITS, SECUREBITS_MASK, 0, 0, 0) };
         if res != 0 {
             return Err(format!(
@@ -164,44 +171,47 @@ fn drop_capabilities(strict: bool, lax: bool) -> Result<(), String> {
             ));
         }
     }
+    // Bounding first (it needs CAP_SETPCAP, which the effective set still holds).
     if strict {
-        caps::clear(None, caps::CapSet::Bounding).map_err(|e| format!("Failed to drop bounding capabilities: {e}"))?;
+        privileges::clear_bounding()?;
     }
-    caps::clear(None, caps::CapSet::Effective).map_err(|e| format!("Failed to drop effective capabilities: {e}"))?;
-    caps::clear(None, caps::CapSet::Permitted).map_err(|e| format!("Failed to drop permitted capabilities: {e}"))?;
-    caps::clear(None, caps::CapSet::Inheritable)
-        .map_err(|e| format!("Failed to drop inheritable capabilities: {e}"))?;
-    caps::clear(None, caps::CapSet::Ambient).map_err(|e| format!("Failed to drop ambient capabilities: {e}"))?;
+    privileges::clear_eff_perm_inh()?;
+    privileges::clear_ambient()?;
     Ok(())
 }
 
 fn drop_parent_capabilities() -> Result<(), String> {
-    caps::clear(None, caps::CapSet::Bounding)
-        .map_err(|e| format!("Failed to drop parent bounding capabilities: {e}"))?;
-    caps::clear(None, caps::CapSet::Effective)
-        .map_err(|e| format!("Failed to drop parent effective capabilities: {e}"))?;
-    caps::clear(None, caps::CapSet::Permitted)
-        .map_err(|e| format!("Failed to drop parent permitted capabilities: {e}"))?;
-    caps::clear(None, caps::CapSet::Inheritable)
-        .map_err(|e| format!("Failed to drop parent inheritable capabilities: {e}"))?;
-    caps::clear(None, caps::CapSet::Ambient)
-        .map_err(|e| format!("Failed to drop parent ambient capabilities: {e}"))?;
+    privileges::drop_all()
+}
+
+fn cstr(s: &str) -> Result<CString, String> {
+    CString::new(s).map_err(|_| format!("path contains an interior NUL byte: {s:?}"))
+}
+
+/// `mount(source, target, NULL, flags, NULL)`.
+fn do_mount(source: Option<&str>, target: &str, flags: libc::c_ulong, what: &str) -> Result<(), String> {
+    let c_source = source.map(cstr).transpose()?;
+    let c_target = cstr(target)?;
+    let src_ptr = c_source.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
+    // SAFETY: valid NUL-terminated pointers (or NULL); fstype/data unused.
+    let rc = unsafe { libc::mount(src_ptr, c_target.as_ptr(), std::ptr::null(), flags, std::ptr::null()) };
+    if rc != 0 {
+        return Err(format!("Failed to {what}: {}", std::io::Error::last_os_error()));
+    }
     Ok(())
 }
 
 fn mount_resolve_conf() -> Result<(), String> {
-    // unshare the mount namespace
-    sched::unshare(sched::CloneFlags::CLONE_NEWNS).map_err(|e| format!("Failed to unshare mount namespace: {e}"))?;
-
-    // prevent mount propagation back to the host
-    mount::mount(
-        Some("none"),
-        "/",
-        None::<&str>,
-        mount::MsFlags::MS_REC | mount::MsFlags::MS_PRIVATE,
-        None::<&str>,
-    )
-    .map_err(|e| format!("Failed to make root mount private: {e}"))?;
+    // Unshare the mount namespace so our changes don't touch the host.
+    // SAFETY: plain unshare with a constant flag.
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(format!(
+            "Failed to unshare mount namespace: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // Prevent mount propagation back to the host.
+    do_mount(None, "/", libc::MS_REC | libc::MS_PRIVATE, "make root mount private")?;
 
     let tmp_path = format!(
         "/dev/shm/docker-intrude-resolv-{}-{}",
@@ -224,38 +234,48 @@ fn mount_resolve_conf() -> Result<(), String> {
         .write_all(b"nameserver 127.0.0.11\noptions ndots:0\n")
         .map_err(|e| format!("Failed to write to shm file: {e}"))?;
 
-    // bind mount the memory file over resolv.conf
-    let mount_res = mount::mount(
-        Some(tmp_path.as_str()),
+    // Bind-mount the memory file over resolv.conf, then unlink the source.
+    let mount_res = do_mount(
+        Some(&tmp_path),
         "/etc/resolv.conf",
-        None::<&str>,
-        mount::MsFlags::MS_BIND,
-        None::<&str>,
+        libc::MS_BIND,
+        "bind mount resolv.conf",
     );
-    // unlink the file from the host filesystem.
-    let _ = std::fs::remove_file(&tmp_path);
-    mount_res.map_err(|e| format!("Failed to bind mount resolv.conf: {e}"))?;
-    Ok(())
+    let _ = std::fs::remove_file(Path::new(&tmp_path));
+    mount_res
 }
 
-
-fn terminate_child_gracefully(child: unistd::Pid) -> Result<i32, String> {
+fn terminate_child_gracefully(child: libc::pid_t) -> Result<i32, String> {
     const EXIT_CODE_SIGTERM: i32 = 143;
-    let _ = kill(child, Signal::SIGTERM);
+    // SAFETY: signalling our own child.
+    unsafe { libc::kill(child, libc::SIGTERM) };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
-        match wait::waitpid(child, Some(wait::WaitPidFlag::WNOHANG)) {
-            Ok(wait::WaitStatus::Exited(_, code)) => return Ok(code),
-            Ok(wait::WaitStatus::Signaled(_, _, _)) => return Ok(EXIT_CODE_SIGTERM),
-            Ok(wait::WaitStatus::StillAlive) => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            _ => return Ok(0),
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid on our own child.
+        let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        if r == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50)); // still alive
+            continue;
         }
+        if r < 0 {
+            return Ok(0); // already reaped / error
+        }
+        if libc::WIFEXITED(status) {
+            return Ok(libc::WEXITSTATUS(status));
+        }
+        if libc::WIFSIGNALED(status) {
+            return Ok(EXIT_CODE_SIGTERM);
+        }
+        return Ok(0);
     }
-    // child ignored SIGTERM: escalate to SIGKILL and reap
-    let _ = kill(child, Signal::SIGKILL);
-    let _ = wait::waitpid(child, None);
+    // child ignored SIGTERM: escalate to SIGKILL and reap.
+    // SAFETY: signalling / reaping our own child.
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+        let mut status: libc::c_int = 0;
+        libc::waitpid(child, &mut status, 0);
+    }
     Err("Child process unresponsive to SIGTERM; forcefully terminated with SIGKILL".to_string())
 }
 
@@ -264,14 +284,15 @@ mod tests {
     use super::*;
 
     // Note: we assert on the composed mask rather than calling prctl, because
-    // SECBIT_*_LOCKED is irreversible for the lifetime of the process — actually
+    // SECBIT_*_LOCKED is irreversible for the lifetime of the process - actually
     // invoking drop_capabilities() would poison the test runner. The mask IS the
     // security property, so guarding its composition is the meaningful check.
 
     #[test]
     fn securebits_locks_noroot() {
         assert_ne!(
-            SECUREBITS_MASK & SECBIT_NOROOT_LOCKED, 0,
+            SECUREBITS_MASK & SECBIT_NOROOT_LOCKED,
+            0,
             "SECBIT_NOROOT must be locked; an unlocked NOROOT is advisory only \
              (any process can clear it via prctl without a capability)."
         );
@@ -292,10 +313,8 @@ mod tests {
         const SECBIT_NO_SETUID_FIXUP_LOCKED: libc::c_ulong = 0x08;
         const SECBIT_KEEP_CAPS: libc::c_ulong = 0x10;
         const SECBIT_KEEP_CAPS_LOCKED: libc::c_ulong = 0x20;
-        let unused = SECBIT_NO_SETUID_FIXUP
-            | SECBIT_NO_SETUID_FIXUP_LOCKED
-            | SECBIT_KEEP_CAPS
-            | SECBIT_KEEP_CAPS_LOCKED;
+        let unused =
+            SECBIT_NO_SETUID_FIXUP | SECBIT_NO_SETUID_FIXUP_LOCKED | SECBIT_KEEP_CAPS | SECBIT_KEEP_CAPS_LOCKED;
         assert_eq!(SECUREBITS_MASK & unused, 0);
     }
 

@@ -1,101 +1,58 @@
-# docker-intrude
+# docker-heist
 
-Linux statically-linked utility that executes local host binaries inside a specific Docker network namespace. 
+A collection of small, statically-linked **developer tools** for local
+workstations that pull off the tricks Docker makes awkward, running host tools on
+container networks, and making bind-mount ownership just work.
 
-It spins up a temporary container with a static IP, uses `nsenter` to attach your command to its network, and runs it under your current user.
+| Tool | Problem it solves |
+| --- | --- |
+| [**docker-bluff**](crates/docker-bluff/README.md) | Bind mounts give you a UID/GID mismatch, files a container creates come out `root`-owned on the host, and your files aren't writable by the container's user. It wraps the bind mounts in Linux **idmapped mounts** so both sides see the files as their own, at native speed, no `bindfs`/FUSE, no `chown -R`. |
+| [**docker-intrude**](crates/docker-intrude/README.md) | You want a *host* tool (`psql`, `curl`, a debugger, your app under `mvn`/`cargo run`) to reach container IPs and service DNS names on a **specific Docker network**, without dockerizing it or publishing ports. It drops your command straight into that network's namespace, still running as you. |
 
-## Security & Trust Model
+## Threat Model
 
-By default, `docker-intrude` is designed to run tools that require Linux file capabilities (like `/bin/ping` or `gdb`). 
-To balance usability and security, it applies the following isolation measures before executing your command:
-- **Capability Shedding:** The wrapper holds its file capabilities (`cap_sys_admin`, `cap_sys_ptrace`, `cap_setpcap`) only long enough to enter the namespace and mount `resolv.conf`. After `fork()`, the parent drops **all** capability sets (including Bounding) before entering its wait loop; the child drops Effective/Permitted/Inheritable/Ambient (and Bounding, in `--strict` mode) before exec'ing the target.
-- **Setuid Protection:** Activates and **locks** `SECBIT_NOROOT` (and `SECBIT_NO_CAP_AMBIENT_RAISE`) so that legacy setuid-root binaries can no longer automatically acquire root privileges during execution. Locking makes the boundary irreversible for the lifetime of the spawned process; without the lock, `SECBIT_NOROOT` would be advisory only, since any process can clear it via `prctl` without requiring any capability.
-- **Bounding Set Preservation:** Leaves the Capability Bounding Set intact by default so that legitimate file capabilities continue to function.
+**These are developer tools for trusted, single-tenant workstations, not a
+security boundary.** They perform privileged mount and namespace operations and
+are installed executable only by the `docker` group, whose members are already
+root-equivalent on the host (`docker run -v /:/host --privileged ...`), so the
+tools grant them no new privilege. They are explicitly **not** hardened against a
+hostile local user and are not meant for multi-tenant or production machines.
 
-### Accepted Design Tradeoffs & Operational Limits
+Within that scope each tool minimizes what it exposes: it runs as the invoking
+user with file capabilities (never setuid-root), holds those capabilities only for
+the privileged setup and drops them before waiting, and hands the command it runs
+no capabilities of its own. See each tool's README for its specific measures.
 
-Because `docker-intrude` is designed as a local development and debugging wrapper, certain operational behaviors are intentional tradeoffs:
+## Layout
 
-* **Environment Variable Inheritance:** The target command inherits your current environment variables unaltered (including `PATH`, `HOME`, and API tokens). This is required for build tools (like Maven, Gradle, or npm) to function properly, but means `docker-intrude` does not scrub sensitive variables from the target process.
-* **Elevated File Capabilities (`setcap`):** The binary requires `cap_sys_admin`, `cap_sys_ptrace`, and `cap_setpcap` to manipulate kernel network namespaces without `sudo`. Users in the local `docker` group are already equivalent to `root` on Linux systems; these capabilities are restricted to executing namespaces and should only be installed on single-tenant or trusted developer workstations.
-* **Custom Socket Paths (`DOCKER_HOST`):** The tool honors the `DOCKER_HOST` environment variable if pointing to a local UNIX socket. While `docker-intrude` validates that the socket owner matches the current user or `root`, users should ensure their environment variables are not manipulated.
+This is a Cargo workspace; the tools share one version and are released
+together.
 
-### Strict Mode (`--strict`)
-If your command doesn't need file capabilities, or if you prefer maximum privilege isolation, 
-pass the `--strict` flag to clear the Bounding Set as well:
-
-```bash
-docker-intrude --name my-project --net dev-net --ip 172.18.0.22 --strict -- ping 172.18.0.1
+```
+crates/docker-bluff     # tool: idmapped-mount wrapper
+crates/docker-intrude   # tool: network-namespace entry
+crates/dockersock       # shared: Docker daemon Unix-socket client
+crates/privileges       # shared: Linux capability drop/query
+crates/signals          # shared: parent-side signal handling
 ```
 
-### Lax Mode (`--lax`)
-If your command needs a setuid-root binary to actually function as root (for example `sudo`, or a
-legacy installer), the default locked `SECBIT_NOROOT` boundary will block it. Pass `--lax` to skip
-securebits manipulation entirely, so setuid-root binaries can acquire privileges through the normal
-kernel path. File capabilities continue to work (the Bounding Set is preserved).
-
-`--lax` reduces isolation and is mutually exclusive with `--strict`. Use it only when the command
-genuinely requires it.
+## Build & install
 
 ```bash
-docker-intrude --name my-project --net dev-net --ip 172.18.0.22 --lax -- sudo whoami
+make build            # debug build of every tool
+make build-release    # static musl release build of every tool
+make test             # run all tests
+
+make install                 # install every tool (each with its own capabilities)
+make install-docker-bluff    # or just one
 ```
 
-## How It Works & DNS Resolution
-`docker-intrude` provisions a temporary network container to hold a specific Docker network namespace open. 
+Each tool installs `root:docker`, mode `750` (runnable only by the `docker`
+group, which is already root-equivalent), with a tool-specific `setcap` set,
+see the per-crate README for exactly which capabilities each one needs and why.
 
-It then uses kernel namespaces (`setns`) to attach your host command to that network.
-
-Host binary would still read the host's `/etc/resolv.conf` and fail to resolve names in most distros.
-To address this without modifying your host filesystem, `docker-intrude` overrides the configuration:
-
-1. It unshares the mount namespace (`CLONE_NEWNS`) to isolate filesystem changes from the host.
-2. It marks the root mount as private (`MS_PRIVATE | MS_REC`) to prevent mount propagation.
-3. It creates a temporary file (`/dev/shm`) and writes Docker's embedded DNS configuration (`nameserver 127.0.0.11\noptions ndots:0\n`) to it.
-4. It bind-mounts this file directly over `/etc/resolv.conf` and unlinks the source file from `/dev/shm`.
-
-
-## Prerequisites
-- **Linux only** (relies on native kernel namespaces).
-- **Docker** running and accessible.
-
-## Installation
-Install the latest pre-compiled binary via curl:
-```bash
-curl -sSL \
-  https://github.com/optionfactory/docker-intrude/releases/latest/download/docker-intrude-linux-amd64-musl \
-  | sudo tee /usr/local/bin/docker-intrude > /dev/null \
-  && sudo chown root:docker /usr/local/bin/docker-intrude \
-  && sudo chmod 750 /usr/local/bin/docker-intrude \
-  && sudo setcap cap_sys_admin,cap_sys_ptrace,cap_setpcap+ep /usr/local/bin/docker-intrude
-```
-
-## Build from Source
-Ensure you have Rust installed, then clone the repository and build:
-
-```bash
-git clone [https://github.com/optionfactory/docker-intrude](https://github.com/optionfactory/docker-intrude)
-cd docker-intrude
-make build-release 
-make install
-```
-
-## Usage
-```bash
-docker-intrude --name <name> --net <network> --ip <ip-address> [-v] -- <command...>
-```
-
-## Example
-Run a local Maven project inside the dev-net Docker network:
-```bash
-docker-intrude --name my-project --net dev-net --ip 172.18.0.22 -- ./mvn spring-boot:run
-```
-
-## Options
-- `--name`, `-n` : Name of the temporary Docker container.
-- `--net` : The Docker network to join.
-- `--ip` : The IP address to assign to the container.
-- `--verbose`, `-v` : Enable detailed setup and status logging.
-- `--strict` : Clear the Capability Bounding Set (maximum isolation; breaks file-capability tools like `ping`/`gdb`).
-- `--lax` : Disable setuid-root protection entirely (no securebits). For commands needing `sudo`/legacy setuid tools. Mutually exclusive with `--strict`.
-- `--` : Separates wrapper arguments from the command being executed.
+To install a prebuilt binary instead, download the tool's
+`<tool>-linux-amd64-musl` asset from the [latest
+release](https://github.com/optionfactory/docker-heist/releases/latest), then set
+its ownership and capabilities the same way `make install-<tool>` does, the
+per-crate README lists the exact `chown`/`chmod`/`setcap` for that tool.

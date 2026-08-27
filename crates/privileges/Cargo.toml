@@ -1,0 +1,9 @@
+[package]
+name = "privileges"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Linux capability operations (drop/query) via raw libc/prctl, for the docker-heist tools"
+
+[dependencies]
+libc.workspace = true

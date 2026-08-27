@@ -1,0 +1,13 @@
+[package]
+name = "docker-bluff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "docker run wrapper that fixes bind-mount UID/GID mismatches with Linux idmapped mounts"
+
+[dependencies]
+dockersock = { path = "../dockersock" }
+privileges = { path = "../privileges" }
+signals = { path = "../signals" }
+libc.workspace = true
+serde_json.workspace = true

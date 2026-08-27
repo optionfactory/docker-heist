@@ -54,14 +54,12 @@ fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String>
                 cmd.extend(args);
                 break;
             }
+            other if other.starts_with('-') => return Err(format!("Unknown flag: {other}")),
+            // First non-flag positional starts the command; take the rest verbatim.
             other => {
-                if other.starts_with('-') {
-                    return Err(format!("Unknown flag: {other}"));
-                } else {
-                    cmd.push(other.to_string());
-                    cmd.extend(args);
-                    break;
-                }
+                cmd.push(other.to_string());
+                cmd.extend(args);
+                break;
             }
         }
     }
@@ -111,9 +109,13 @@ fn print_help() {
     eprintln!("  docker-intrude --version");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --strict       Clear the capability bounding set (breaks ping/gdb file capabilities, provides maximum isolation)");
+    eprintln!(
+        "  --strict       Clear the capability bounding set (breaks ping/gdb file capabilities, provides maximum isolation)"
+    );
     eprintln!("  --lax          Disable setuid-root protection entirely (no securebits). Required when the command");
-    eprintln!("                 needs setuid-root binaries to function (e.g. sudo). Reduces isolation; not combinable with --strict.");
+    eprintln!(
+        "                 needs setuid-root binaries to function (e.g. sudo). Reduces isolation; not combinable with --strict."
+    );
 }
 
 #[cfg(test)]
@@ -150,10 +152,7 @@ mod tests {
             "uña",
             "with\nnewline",
         ] {
-            assert!(
-                !is_valid_docker_identifier(bad),
-                "should reject {bad:?}"
-            );
+            assert!(!is_valid_docker_identifier(bad), "should reject {bad:?}");
         }
     }
 
@@ -183,7 +182,9 @@ mod tests {
 
     #[test]
     fn enables_verbose_and_strict() {
-        let cfg = ok(&["--name", "n", "--net", "m", "--ip", "1.2.3.4", "-v", "--strict", "--", "x"]);
+        let cfg = ok(&[
+            "--name", "n", "--net", "m", "--ip", "1.2.3.4", "-v", "--strict", "--", "x",
+        ]);
         assert!(cfg.verbose);
         assert!(cfg.strict);
     }
@@ -235,7 +236,9 @@ mod tests {
 
     #[test]
     fn multiple_commands_after_separator() {
-        let cfg = ok(&["--name", "n", "--net", "m", "--ip", "1.2.3.4", "--", "env", "--flag", "value"]);
+        let cfg = ok(&[
+            "--name", "n", "--net", "m", "--ip", "1.2.3.4", "--", "env", "--flag", "value",
+        ]);
         assert_eq!(cfg.cmd, vec!["env", "--flag", "value"]);
     }
 
@@ -292,7 +295,10 @@ mod tests {
         // IPv6 must be rejected: the Docker payload only populates IPv4Address
         // (see IpamConfig). Accepting IPv6 would silently misroute it.
         let err = parse_from(args(&["--name", "n", "--net", "m", "--ip", "::1", "--", "x"])).unwrap_err();
-        assert!(err.to_lowercase().contains("ipv4") || err.to_lowercase().contains("ip"), "{err}");
+        assert!(
+            err.to_lowercase().contains("ipv4") || err.to_lowercase().contains("ip"),
+            "{err}"
+        );
     }
 
     #[test]
