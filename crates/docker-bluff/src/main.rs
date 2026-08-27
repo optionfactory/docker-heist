@@ -113,6 +113,7 @@ fn run(opts: Options) -> Result<i32, String> {
 
     let invoker = detect_invoking_user();
     let mapping = build_mapping(&opts.uid_swaps, &opts.gid_swaps, invoker)?;
+    create_missing_sources(&spec.binds, invoker, &log)?;
 
     let mut plans: Vec<Plan> = Vec::new();
     for (bind_index, bind) in spec.remappable_binds() {
@@ -529,6 +530,40 @@ fn detect_invoking_user() -> Ids {
     Ids { uid: ruid, gid: rgid }
 }
 
+/// Create the source directory of every bind flagged `bind-create-src` that
+/// does not exist yet, parents included. Docker (29+) implements the option
+/// too, but creates the directory owned by root; we make every directory we
+/// create owned by the invoking user, so that through the id map the container
+/// user sees it as its own and the host user keeps control of it. Existing
+/// sources (directories or not) are left alone.
+fn create_missing_sources(binds: &[Bind], owner: Ids, log: &Log) -> Result<(), String> {
+    for bind in binds.iter().filter(|b| b.create) {
+        if bind.source.exists() {
+            continue;
+        }
+        let created = create_dir_all_owned(&bind.source, owner)
+            .map_err(|e| format!("creating bind mount source {}: {e}", bind.source.display()))?;
+        log.note(format!(
+            "created bind mount source {} ({} director{}, owner {owner})",
+            bind.source.display(),
+            created,
+            if created == 1 { "y" } else { "ies" }
+        ));
+    }
+    Ok(())
+}
+
+/// `mkdir -p` that hands ownership of the directories it creates (and only
+/// those) to `owner`. Returns how many directories were created.
+fn create_dir_all_owned(path: &Path, owner: Ids) -> std::io::Result<usize> {
+    let missing: Vec<&Path> = path.ancestors().take_while(|p| !p.exists()).collect();
+    std::fs::create_dir_all(path)?;
+    for dir in &missing {
+        std::os::unix::fs::chown(dir, Some(owner.uid), Some(owner.gid))?;
+    }
+    Ok(missing.len())
+}
+
 /// Who the `docker` child runs as. We hold root only for the mount syscalls;
 /// the Docker CLI itself runs as the invoking user whenever that user can
 /// reach the daemon socket, so their credentials, contexts and config apply.
@@ -925,6 +960,26 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
         assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGINT)), 130);
+    }
+
+    #[test]
+    fn create_dir_all_owned_creates_only_the_missing_part() {
+        let base = std::env::temp_dir().join(format!("docker-bluff-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let me = Ids {
+            uid: getuid(),
+            gid: getgid(),
+        };
+        let target = base.join("a/b/c");
+        assert_eq!(create_dir_all_owned(&target, me).unwrap(), 3);
+        assert!(target.is_dir());
+        // Already there: nothing to create, no error.
+        assert_eq!(create_dir_all_owned(&target, me).unwrap(), 0);
+        // A file in the way is an error, not silently accepted.
+        let file = base.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(create_dir_all_owned(&file.join("x"), me).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

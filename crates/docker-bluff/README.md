@@ -153,8 +153,14 @@ docker-bluff --id DISK:SEEN ... --map DIR ... [--] COMMAND [ARGS...]
 | `--verbose` | Explain what is being mounted (and, for docker, released). |
 | `-h`, `--help` / `-V`, `--version` | Help / version. |
 
-Append `noremap` to a bind's options to pass it through untouched:
-`-v /etc/localtime:/etc/localtime:ro,noremap`.
+Per-mount options (stripped before the command reaches Docker):
+
+- `noremap` passes a bind through untouched: `-v /etc/localtime:/etc/localtime:ro,noremap`.
+- `bind-create-src` creates a missing source directory (and parents) on the host
+  before starting, owned by the invoking user, so through the id map the container
+  user sees it as its own: `--mount type=bind,source=$PWD/data,target=/data,bind-create-src`.
+  Docker (29+) implements the same option but creates the directory owned by root;
+  docker-bluff takes it over, so plain `-v`-style binds get it too.
 
 ### Examples
 

@@ -26,6 +26,12 @@ pub const LABEL_KEY: &str = "docker-bluff.id";
 /// Per-mount option (in `-v src:dst:opts` or `--mount ...,noremap`) that
 /// excludes a bind mount from remapping. Stripped before reaching Docker.
 pub const NOREMAP_OPTION: &str = "noremap";
+/// Per-mount option (in `-v src:dst:opts` or `--mount ...,bind-create-src`)
+/// that creates a missing bind source directory on the host before the
+/// container starts. Docker (29+) knows it too but creates the directory
+/// owned by root; we take it over and create it owned by the invoking user,
+/// so it is stripped before reaching Docker.
+pub const BIND_CREATE_SRC_OPTION: &str = "bind-create-src";
 
 /// `docker run` long flags that never take a value (from `docker run --help`,
 /// Docker 29). Unknown flags are assumed to take a value.
@@ -440,10 +446,16 @@ OPTIONS:
     -h, --help                Show this help.
     -V, --version             Show the version.
 
-PER-MOUNT OPTION (docker):
+PER-MOUNT OPTIONS (docker):
     Append `{noremap}` to a bind mount's options to pass it through untouched:
         -v /host/dir:/data:ro,{noremap}
         --mount type=bind,source=/host/dir,target=/data,{noremap}
+    Append `{create}` to create a missing source directory (and parents) on the
+    host before starting, owned by the invoking user - so through the id map
+    the container user sees it as its own. Docker's own `{create}` would create
+    it owned by root instead:
+        --mount type=bind,source=/host/dir/data,target=/data,{create}
+    Both options are stripped before the command reaches Docker.
 
 Only bind mounts of *directories* with absolute host paths are remapped; named
 volumes, anonymous volumes and single-file binds are forwarded as-is.
@@ -460,6 +472,7 @@ daemon over a unix:// socket. Both need CAP_SYS_ADMIN (a capability-endowed
 install, see the README) or root (sudo) for the mount syscalls.",
         version = env!("CARGO_PKG_VERSION"),
         noremap = NOREMAP_OPTION,
+        create = BIND_CREATE_SRC_OPTION,
     )
 }
 
@@ -488,6 +501,9 @@ pub struct Bind {
     pub target: String,
     /// False when the user opted out with `noremap`.
     pub remap: bool,
+    /// True when the user asked for a missing source to be created
+    /// (`bind-create-src`).
+    pub create: bool,
     loc: ValueLoc,
     syntax: BindSyntax,
 }
@@ -632,8 +648,8 @@ impl RunSpec {
     /// Produce the `docker run` arguments (the part *after* `run`): a tracking
     /// `--label KEY=id` followed by the user's arguments with bind sources
     /// replaced. `replacements` maps bind index -> new source path; binds
-    /// without a replacement keep their source (but still lose the `noremap`
-    /// option). The caller prepends the docker binary, any global flags, and
+    /// without a replacement keep their source (but still lose the docker-bluff
+    /// per-mount options, `noremap` and `bind-create-src`). The caller prepends the docker binary, any global flags, and
     /// `run`.
     pub fn render(&self, label_value: &str, replacements: &[(usize, PathBuf)]) -> Vec<String> {
         let mut args = self.args.clone();
@@ -657,6 +673,34 @@ impl RunSpec {
     }
 }
 
+/// The docker-bluff per-mount options found in a bind spec. They are ours, not
+/// Docker's, so `take` reports them as consumed and the caller drops them.
+#[derive(Debug)]
+struct BluffOptions {
+    remap: bool,
+    create: bool,
+}
+
+impl Default for BluffOptions {
+    fn default() -> Self {
+        BluffOptions {
+            remap: true,
+            create: false,
+        }
+    }
+}
+
+impl BluffOptions {
+    fn take(&mut self, option: &str) -> bool {
+        match option {
+            NOREMAP_OPTION => self.remap = false,
+            BIND_CREATE_SRC_OPTION => self.create = true,
+            _ => return false,
+        }
+        true
+    }
+}
+
 /// `-v` spec: `src:dst[:options]`. Returns `None` for anonymous/named volumes.
 fn parse_volume_spec(spec: &str, loc: ValueLoc) -> Option<Bind> {
     let mut parts = spec.splitn(3, ':');
@@ -665,7 +709,7 @@ fn parse_volume_spec(spec: &str, loc: ValueLoc) -> Option<Bind> {
     if !source.starts_with('/') || target.is_empty() {
         return None;
     }
-    let mut remap = true;
+    let mut flags = BluffOptions::default();
     let options: Vec<String> = parts
         .next()
         .map(|o| {
@@ -676,19 +720,13 @@ fn parse_volume_spec(spec: &str, loc: ValueLoc) -> Option<Bind> {
         })
         .unwrap_or_default()
         .into_iter()
-        .filter(|o| {
-            if o == NOREMAP_OPTION {
-                remap = false;
-                false
-            } else {
-                true
-            }
-        })
+        .filter(|o| !flags.take(o))
         .collect();
     Some(Bind {
         source: PathBuf::from(source),
         target: target.to_string(),
-        remap,
+        remap: flags.remap,
+        create: flags.create,
         loc,
         syntax: BindSyntax::Volume {
             target: target.to_string(),
@@ -700,18 +738,11 @@ fn parse_volume_spec(spec: &str, loc: ValueLoc) -> Option<Bind> {
 /// `--mount` spec: comma-separated `key=value` (or bare `readonly`/`ro`).
 /// Returns `None` unless `type=bind` with an absolute source.
 fn parse_mount_spec(spec: &str, loc: ValueLoc) -> Option<Bind> {
-    let mut remap = true;
+    let mut flags = BluffOptions::default();
     let entries: Vec<String> = spec
         .split(',')
         .filter(|s| !s.is_empty())
-        .filter(|e| {
-            if *e == NOREMAP_OPTION {
-                remap = false;
-                false
-            } else {
-                true
-            }
-        })
+        .filter(|e| !flags.take(e))
         .map(str::to_string)
         .collect();
     let mut kind = "volume";
@@ -737,7 +768,8 @@ fn parse_mount_spec(spec: &str, loc: ValueLoc) -> Option<Bind> {
     Some(Bind {
         source: PathBuf::from(source),
         target: target?,
-        remap,
+        remap: flags.remap,
+        create: flags.create,
         loc,
         syntax: BindSyntax::Mount { entries, source_index },
     })
@@ -1016,6 +1048,46 @@ mod tests {
         assert_eq!(
             spec.render("ID", &[]),
             s(&["--label", "docker-bluff.id=ID", "-v", "/a:/b:ro", "-v", "/c:/d", "img"])
+        );
+    }
+
+    #[test]
+    fn bind_create_src_option_is_stripped_and_sets_create() {
+        let spec = parse(&[
+            "-v",
+            "/a:/b:ro,bind-create-src",
+            "--mount",
+            "type=bind,source=/c,target=/d,bind-create-src,readonly",
+            "-v",
+            "/e:/f:noremap,bind-create-src",
+            "-v",
+            "/g:/h",
+            "img",
+        ]);
+        assert_eq!(spec.binds.len(), 4);
+        assert_eq!(
+            spec.binds.iter().map(|b| b.create).collect::<Vec<_>>(),
+            vec![true, true, true, false]
+        );
+        assert_eq!(
+            spec.binds.iter().map(|b| b.remap).collect::<Vec<_>>(),
+            vec![true, true, false, true]
+        );
+        assert_eq!(
+            spec.render("ID", &[]),
+            s(&[
+                "--label",
+                "docker-bluff.id=ID",
+                "-v",
+                "/a:/b:ro",
+                "--mount",
+                "type=bind,source=/c,target=/d,readonly",
+                "-v",
+                "/e:/f",
+                "-v",
+                "/g:/h",
+                "img",
+            ])
         );
     }
 
