@@ -1,7 +1,7 @@
 REPO_OWNER=optionfactory
 REPO_NAME=docker-heist
 TARGET=x86_64-unknown-linux-musl
-TOOLS=docker-intrude docker-bluff
+TOOLS=docker-intrude docker-bluff docker-snitch
 BINDIR=/usr/local/bin
 RELDIR=target/$(TARGET)/release
 VERSION=v$(shell grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
@@ -46,6 +46,9 @@ install-docker-bluff: build-release
 		|| sudo install -d -m 0770 -o root -g docker /run/docker-bluff
 	@echo "installed $(BINDIR)/docker-bluff"
 
+install-docker-snitch: build-release
+	@sudo install -o root -g root -m 755 $(RELDIR)/docker-snitch $(BINDIR)/docker-snitch
+	@echo "installed $(BINDIR)/docker-snitch"
 
 publish-github: build-release
 	@rm -f target/SHA256SUMS
@@ -60,4 +63,4 @@ publish-github: build-release
 		--notes ""
 	-@rm -f $(addprefix target/,$(addsuffix -linux-amd64-musl,$(TOOLS))) target/SHA256SUMS
 
-.PHONY: build build-release test clean check-deps install install-docker-intrude install-docker-bluff publish-github
+.PHONY: build build-release test clean check-deps install install-docker-intrude install-docker-bluff install-docker-snitch publish-github

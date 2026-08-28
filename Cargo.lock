@@ -26,6 +26,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "docker-snitch"
+version = "1.0.0"
+dependencies = [
+ "libc",
+ "signals",
+]
+
+[[package]]
 name = "dockersock"
 version = "1.0.0"
 

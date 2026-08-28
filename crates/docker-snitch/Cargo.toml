@@ -1,0 +1,10 @@
+[package]
+name = "docker-snitch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runs a daemon and relays its file-only logs to stderr, removing from the files what was relayed"
+
+[dependencies]
+signals = { path = "../signals" }
+libc.workspace = true
