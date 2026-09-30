@@ -10,6 +10,31 @@ ownership just work, getting a daemon's file-only logs onto stderr.
 | [**docker-intrude**](crates/docker-intrude/README.md) | You want a *host* tool (`psql`, `curl`, a debugger, your app under `mvn`/`cargo run`) to reach container IPs and service DNS names on a **specific Docker network**, without dockerizing it or publishing ports. It drops your command straight into that network's namespace, still running as you. |
 | [**docker-snitch**](crates/docker-snitch/README.md) | Runs a command and relays whatever gets appended to a set of files to stderr, removing from the files what it has relayed. For daemons (MySQL, MariaDB, ...) that insist on writing some logs to **regular files** and refuse `/dev/stderr`, pipes and FIFOs: those logs reach `docker logs` and stop growing forever. |
 
+## Install
+
+The tools are packaged for Debian/Ubuntu (`amd64`) and Fedora/RHEL/openSUSE
+(`x86_64`), one package per tool. Set up the
+[optionfactory package repository](https://github.com/optionfactory/linux-packages#setup)
+once, then install the ones you need:
+
+```bash
+sudo apt install docker-bluff docker-intrude   # or: sudo dnf install ...
+```
+
+The setup commands run unattended, so they work as-is in provisioning scripts
+and Dockerfiles; see [In a Dockerfile](https://github.com/optionfactory/linux-packages#in-a-dockerfile)
+for installing `docker-snitch` in an image.
+
+The packages install each developer tool as `make install` does: `root:docker`,
+mode `750`, with its capability set, creating the `docker` group if it is
+missing. The tools run only for members of that group; if you are not one yet,
+add yourself and log out and back in (membership is root-equivalent, see
+[Threat Model](#threat-model)):
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
 ## Threat Model
 
 ### Developer tools: docker-bluff, docker-intrude
@@ -18,8 +43,11 @@ ownership just work, getting a daemon's file-only logs onto stderr.
 security boundary.** They perform privileged mount and namespace operations and
 are installed executable only by the `docker` group, whose members are already
 root-equivalent on the host (`docker run -v /:/host --privileged ...`), so the
-tools grant them no new privilege. They are explicitly **not** hardened against a
-hostile local user and are not meant for multi-tenant or production machines.
+tools grant them no new privilege. That premise holds only where a Docker daemon
+is installed: the packages create the `docker` group if it is missing, and on a
+machine without Docker that group is not root-equivalent, so adding a user to it
+does grant the tools' capabilities. They are explicitly **not** hardened against
+a hostile local user and are not meant for multi-tenant or production machines.
 
 Within that scope each tool minimizes what it exposes: it runs as the invoking
 user with file capabilities (never setuid-root), holds those capabilities only for
