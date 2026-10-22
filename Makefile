@@ -32,7 +32,7 @@ install-docker-intrude: build-release
 	@sudo chown root:docker $(BINDIR)/docker-intrude
 	@sudo chmod 750 $(BINDIR)/docker-intrude
 	@sudo setcap cap_sys_admin,cap_sys_ptrace,cap_setpcap+ep $(BINDIR)/docker-intrude
-	@echo "installed $(BINDIR)/docker-intrude"
+	@echo "installed $(BINDIR)/docker-intrude (overrides the docker-intrude package; make uninstall to revert)"
 
 install-docker-bluff: build-release
 	@sudo cp $(RELDIR)/docker-bluff $(BINDIR)/docker-bluff
@@ -44,11 +44,15 @@ install-docker-bluff: build-release
 	@printf 'd /run/docker-bluff 0770 root docker -\n' | sudo tee /usr/lib/tmpfiles.d/docker-bluff.conf >/dev/null
 	@sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/docker-bluff.conf 2>/dev/null \
 		|| sudo install -d -m 0770 -o root -g docker /run/docker-bluff
-	@echo "installed $(BINDIR)/docker-bluff"
+	@echo "installed $(BINDIR)/docker-bluff (overrides the docker-bluff package; make uninstall to revert)"
 
 install-docker-snitch: build-release
 	@sudo install -o root -g root -m 755 $(RELDIR)/docker-snitch $(BINDIR)/docker-snitch
-	@echo "installed $(BINDIR)/docker-snitch"
+	@echo "installed $(BINDIR)/docker-snitch (overrides the docker-snitch package; make uninstall to revert)"
+
+uninstall:
+	@for t in $(TOOLS); do sudo rm -f $(BINDIR)/$$t; done
+	@echo "removed $(addprefix $(BINDIR)/,$(TOOLS))"
 
 publish-github: build-release
 	@rm -f target/SHA256SUMS
@@ -63,4 +67,4 @@ publish-github: build-release
 		--notes ""
 	-@rm -f $(addprefix target/,$(addsuffix -linux-amd64-musl,$(TOOLS))) target/SHA256SUMS
 
-.PHONY: build build-release test clean check-deps install install-docker-intrude install-docker-bluff install-docker-snitch publish-github
+.PHONY: build build-release test clean check-deps install install-docker-intrude install-docker-bluff install-docker-snitch uninstall publish-github

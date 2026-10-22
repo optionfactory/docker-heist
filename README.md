@@ -89,7 +89,14 @@ make test             # run all tests
 make install                 # install the developer tools (each with its own capabilities)
 make install-docker-bluff    # or just one
 make install-docker-snitch  # for local testing only; images install it from the release asset
+make uninstall               # remove the locally built tools, so the packaged ones apply again
 ```
+
+`make install` puts the tools in `/usr/local/bin`, which comes before the
+packaged copies in `/usr/bin` in `PATH`. Run `make uninstall` when you are done
+with the local build, or package upgrades will stay hidden behind it. It leaves
+`/usr/lib/tmpfiles.d/docker-bluff.conf` in place, since the `docker-bluff`
+package installs the same file.
 
 Each developer tool installs `root:docker`, mode `750` (runnable only by the
 `docker` group, which is already root-equivalent), with a tool-specific `setcap`
