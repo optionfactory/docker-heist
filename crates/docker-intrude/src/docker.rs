@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use dockersock::Socket;
 
-//pinned to optionfactory/sloth:235
+//pinned to optionfactory/sloth:247
 const SLOTH_IMAGE: &str =
-    "optionfactory/sloth:235@sha256:112c8d8b4fff453dbbf2fbc4950d339bccd3662dcdbe59fa5563c67f5ec89ccd";
+    "optionfactory/sloth:247@sha256:4560d04e08fe1c7d29dd88d160dd9972ab6ad8c078bb5492e273cb92ef456cd5";
 const SLOTH_IMAGE_ENCODED: &str =
-    "optionfactory%2Fsloth%3A235%40sha256%3A112c8d8b4fff453dbbf2fbc4950d339bccd3662dcdbe59fa5563c67f5ec89ccd";
+    "optionfactory%2Fsloth%3A247%40sha256%3A4560d04e08fe1c7d29dd88d160dd9972ab6ad8c078bb5492e273cb92ef456cd5";
 
 #[derive(serde::Serialize)]
 struct HostConfig {
