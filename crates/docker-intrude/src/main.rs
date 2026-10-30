@@ -96,9 +96,9 @@ fn execute_in_namespace(config: cli::Config) -> Result<i32, String> {
     // ---- parent ----
     drop(ns_file);
     drop_parent_capabilities()?;
-    // Ignore the terminal signals the child handles itself, and catch SIGTERM so
-    // the waitpid loop below (interrupted by EINTR) can forward it to the child.
-    signals::install(&[libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
+    // Ignore the terminal signals the child handles itself, and catch SIGTERM and
+    // SIGHUP so the waitpid loop below (interrupted by EINTR) can terminate the child.
+    signals::install(&[libc::SIGINT, libc::SIGQUIT]);
 
     loop {
         let mut status: libc::c_int = 0;

@@ -44,9 +44,9 @@ const SECURE_PATH: &[&str] = &[
 ];
 /// Signals the parent ignores so it stays alive to clean up and forward. The
 /// terminal delivers these to the whole process group, so the child still gets
-/// them directly. SIGTERM is *not* here - the parent catches it (via the
-/// `signals` crate) and forwards it to the child.
-const PARENT_IGNORED_SIGNALS: &[libc::c_int] = &[libc::SIGINT, libc::SIGHUP, libc::SIGQUIT];
+/// them directly. SIGTERM and SIGHUP are *not* here - the parent catches them
+/// (via the `signals` crate) and terminates the child.
+const PARENT_IGNORED_SIGNALS: &[libc::c_int] = &[libc::SIGINT, libc::SIGQUIT];
 /// Signals the child resets to default before exec, so the target has normal
 /// dispositions regardless of what the parent installed.
 const CHILD_RESET_SIGNALS: &[libc::c_int] = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
@@ -166,8 +166,8 @@ fn run(opts: Options) -> Result<i32, String> {
         log.note(format!("  gid_map: {line}"));
     }
 
-    // Ignore terminal signals the container handles itself, but catch SIGTERM so
-    // a `kill` of the wrapper is forwarded on to `docker run`.
+    // Ignore terminal signals the container handles itself, but catch SIGTERM and
+    // SIGHUP so a `kill` of the wrapper, or its terminal going away, reaches `docker run`.
     signals::install(PARENT_IGNORED_SIGNALS);
 
     let docker_gid = std::fs::metadata(client.socket_path()).map(|m| m.gid()).unwrap_or(0);
@@ -243,7 +243,7 @@ enum Outcome {
     Finished(Option<String>),
     /// `docker run` exited and no container carrying our label exists.
     DockerExited,
-    /// A SIGTERM arrived during start-up; forward it to docker after cleanup.
+    /// A SIGTERM or SIGHUP arrived during start-up; forward it to docker after cleanup.
     Terminated,
 }
 
@@ -786,7 +786,7 @@ fn dir_writable_by_us(meta: &std::fs::Metadata) -> bool {
     }
 }
 
-/// Wait for `child`, forwarding a SIGTERM aimed at the wrapper on to it. This is
+/// Wait for `child`, terminating it when the wrapper gets a SIGTERM or SIGHUP. This is
 /// a poll loop (std's `Child` gives us no interruptible wait), which is fine for
 /// a wrapper: the child is what does the work.
 fn wait_for(child: &mut Child, what: &str) -> Result<ExitStatus, String> {

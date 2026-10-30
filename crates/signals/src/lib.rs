@@ -3,8 +3,9 @@
 //! Two flavours, for two kinds of wrapper:
 //!
 //! - A wrapper that wants to ignore the terminal signals its child handles
-//!   itself, but catch `SIGTERM` so it can forward it to the child (rather than
-//!   being ignored or leaving it orphaned): [`install`] + [`terminate_requested`].
+//!   itself, but catch `SIGTERM` and `SIGHUP` so it can terminate the child
+//!   (rather than being ignored or leaving it orphaned): [`install`] +
+//!   [`terminate_requested`].
 //! - A wrapper that forwards a whole set of signals to its child as they arrive
 //!   (an init-like parent): [`install_forwarding`] + [`forward_pending`].
 //!
@@ -22,9 +23,14 @@ extern "C" fn on_term(_: c_int) {
     TERMINATED.store(true, Ordering::Relaxed);
 }
 
-/// In the parent: ignore `ignored`, and catch `SIGTERM` with a *non-restarting*
-/// handler (so a blocking `waitpid` returns `EINTR`) that sets a flag readable
-/// via [`terminate_requested`].
+/// In the parent: ignore `ignored`, and catch `SIGTERM` and `SIGHUP` with a
+/// *non-restarting* handler (so a blocking `waitpid` returns `EINTR`) that sets a
+/// flag readable via [`terminate_requested`].
+///
+/// `SIGHUP` must not be ignored: when the wrapper leads the session of a terminal
+/// that goes away (e.g. the supervisor holding its pty dies), the kernel hangs up
+/// the session leader alone, and the child hears nothing until the leader exits.
+/// A `SIGHUP` already ignored at start-up (`nohup`) stays ignored.
 pub fn install(ignored: &[c_int]) {
     // SAFETY: installing SIG_IGN and a sigaction with a valid handler are sound.
     unsafe {
@@ -36,6 +42,11 @@ pub fn install(ignored: &[c_int]) {
         sa.sa_flags = 0; // no SA_RESTART, so waitpid returns EINTR
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        let mut inherited: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut inherited);
+        if inherited.sa_sigaction != libc::SIG_IGN {
+            libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
+        }
     }
 }
 
@@ -49,7 +60,7 @@ pub fn reset_to_default(signals: &[c_int]) {
     }
 }
 
-/// Returns `true` exactly once after each `SIGTERM`: it reads and clears the flag
+/// Returns `true` exactly once after each `SIGTERM` or `SIGHUP`: it reads and clears the flag
 /// the [`install`]ed handler sets.
 pub fn terminate_requested() -> bool {
     TERMINATED.swap(false, Ordering::Relaxed)
@@ -92,9 +103,35 @@ pub fn forward_pending(child: libc::pid_t) {
     }
 }
 
-/// Returns whether a `SIGTERM` is pending *without* clearing the flag, so a
+/// Returns whether a `SIGTERM` or `SIGHUP` is pending *without* clearing the flag, so a
 /// later [`terminate_requested`] still sees it. Useful to break an intermediate
 /// poll loop early and let the main wait loop do the actual forwarding.
 pub fn terminate_pending() -> bool {
     TERMINATED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One test: signal dispositions and the flag are process-wide.
+    #[test]
+    fn hangup_requests_termination_unless_inherited_as_ignored() {
+        // SAFETY: setting a disposition and raising a signal at ourselves.
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            install(&[]);
+            libc::raise(libc::SIGHUP);
+        }
+        assert!(!terminate_requested(), "nohup'd: SIGHUP must stay ignored");
+
+        // SAFETY: as above.
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            install(&[]);
+            libc::raise(libc::SIGHUP);
+        }
+        assert!(terminate_requested());
+        assert!(!terminate_requested(), "the request is consumed once");
+    }
 }
