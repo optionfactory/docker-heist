@@ -54,7 +54,13 @@ uninstall:
 	@for t in $(TOOLS); do sudo rm -f $(BINDIR)/$$t; done
 	@echo "removed $(addprefix $(BINDIR)/,$(TOOLS))"
 
-publish-github: build-release
+# the release is tagged on the commit GitHub has: only a clean tree, with master pushed
+pushed:
+	@git diff --quiet HEAD || { echo "uncommitted changes: commit them first"; exit 1; }
+	@git fetch -q origin master
+	@[ "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/master)" ] || { echo "master is not pushed: push it first"; exit 1; }
+
+publish-github: pushed build-release
 	@rm -f target/SHA256SUMS
 	@for t in $(TOOLS); do cp $(RELDIR)/$$t target/$$t-linux-amd64-musl; done
 	@cd target && sha256sum $(addsuffix -linux-amd64-musl,$(TOOLS)) > SHA256SUMS
@@ -67,4 +73,4 @@ publish-github: build-release
 		--notes ""
 	-@rm -f $(addprefix target/,$(addsuffix -linux-amd64-musl,$(TOOLS))) target/SHA256SUMS
 
-.PHONY: build build-release test clean check-deps install install-docker-intrude install-docker-bluff install-docker-snitch uninstall publish-github
+.PHONY: build build-release test clean check-deps install install-docker-intrude install-docker-bluff install-docker-snitch uninstall pushed publish-github
