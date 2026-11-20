@@ -88,6 +88,9 @@ refusal is the filesystem backing Docker's data root (`docker info --format
 '{{.DockerRootDir}}'`, then `df -T` on it): ext4 and xfs collapse, btrfs and zfs
 punch, and so does NFSv4.2 (Linux clients since 4.16 map punch-hole to
 `DEALLOCATE`). A `--tmpfs` or `emptyDir` mount on the log directory punches.
+Podman behaves the same with the kernel overlay driver; rootless setups that use
+`fuse-overlayfs` instead always punch, because FUSE forwards punch-hole but not
+collapse-range.
 Anything without both modes, e.g. a data root on vfat or on NFS v3/4.0/4.1 (or a
 v4.2 server without `DEALLOCATE`), or a log directory explicitly bind-mounted
 through 9p/virtiofs, makes docker-snitch refuse to start with
